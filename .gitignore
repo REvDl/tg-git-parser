@@ -1,0 +1,26 @@
+# IDE
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+venv/
+.venv/
+*.egg-info/
+
+
+# image tracking
+
+foto_for_track.png
+one.png
+two.png
+three.png
+four.png
+five.png
+*.png
+
+
+My_fantasy/TrackWebcam/face_landmarker.task
