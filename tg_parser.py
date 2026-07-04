@@ -3,25 +3,26 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime
 
-# ---------- Настройки ----------
+# ---------- Settings ----------
 JSON_PATH = "result.json"
 OUTPUT_DIR = "history_codes"
 MANIFEST_PATH = ".synced_msg_ids.json"
-LONG_TEXT_THRESHOLD = 50          # символов, ниже — считаем шумом (для одиночных сообщений)
-CLUSTER_MIN_LEN = 500              # от скольки символов сообщение считается "частью дампа"
-CLUSTER_MAX_GAP_SEC = 5            # макс. разрыв между сообщениями одного дампа
+LONG_TEXT_THRESHOLD = 50          # chars; below this a single message is considered noise
+CLUSTER_MIN_LEN = 500              # from how many chars a message is considered "part of a dump"
+CLUSTER_MAX_GAP_SEC = 5            # max gap between messages of the same dump
 
 GIT_AUTHOR_NAME = "Telegram Archive"
 GIT_AUTHOR_EMAIL = "archive@localhost"
 
-# ---------- Детектор путей файлов внутри текста ----------
+# ---------- Detector of file paths inside text ----------
 KNOWN_EXT = (
     "py|js|ts|jsx|tsx|cpp|c|h|hpp|cs|java|go|rs|php|rb|sql|sh|bash|"
     "html|css|json|yml|yaml|md|txt|kt|swift|env|toml|ini|cfg"
 )
 
-# Стиль 1: "# ======\n# 📂 path/to/file.py\n# ======"
+# Style 1: "# ======\n# 📂 path/to/file.py\n# ======"
 FANCY_MARKER_RE = re.compile(
     r'#\s*[=\-]{10,}\s*\n'
     r'#\s*(?:📂\s*)?([\w\-./]+\.(?:' + KNOWN_EXT + r'))\s*\n'
@@ -29,23 +30,32 @@ FANCY_MARKER_RE = re.compile(
     re.M,
 )
 
-# Стиль 2: "main.py:" / "app/route.py:" одна строка сама по себе
+# Style 2: "main.py:" / "app/route.py:" on its own line
 SIMPLE_MARKER_RE = re.compile(
     r'^([\w\-]+(?:/[\w\-]+)*\.(?:' + KNOWN_EXT + r'))\s*:\s*$',
     re.M,
 )
 
-# ---------- Эвристика "похоже на код" (для сообщений без явных маркеров) ----------
+# ---------- Heuristic "looks like code" (for messages without explicit markers) ----------
 CODE_LINE_RE = re.compile(
     r'^\s*(def |class |import |from\s+\S+\s+import|return\b|if\s|elif\s|else\s*:|'
     r'for\s|while\s|try\s*:|except|with\s|async def|await\s|@\w+|print\(|'
     r'const\s|let\s|var\s|function\s*\(|#include|using namespace|public\s|private\s|'
     r'SELECT\s|INSERT\s|UPDATE\s|DELETE FROM|\}\s*$|\{\s*$)'
-    r'|^\s*[\w\.\[\]]+\s*[:=]\s*.+'
+    r'|^\s*[\w\.\[\]]{2,}\s*[:=](?!\\)\s*.+'  # min 2 chars + no ":\" (blocks "C:\...")
     r'|^\s{2,}\S'
 )
 
 URL_LINE_RE = re.compile(r'^\s*[\w\-]+://\S+\s*$')
+
+# Pasted terminal/console sessions (cmd.exe or shell prompts) look nothing like
+# source code, but their prompts ("C:\Users\x>", "user@host:~$") happen to match
+# the generic "key: value" heuristic below (a bare drive letter "C:" satisfies it),
+# which used to inflate code_density and mislabel these as .py files.
+TERMINAL_PROMPT_RE = re.compile(
+    r'^[A-Za-z]:\\.*>|^\$\s|^[\w.\-]+@[\w.\-]+:.*[$#]\s*$',
+    re.M,
+)
 
 LANG_TO_EXT = {
     "python": "py", "javascript": "js", "typescript": "ts", "cpp": "cpp",
@@ -64,7 +74,7 @@ KEYWORD_EXT_RULES = [
 ]
 
 
-# ================= Базовые утилиты чтения сообщений =================
+# ================= Basic message-reading utilities =================
 
 def get_full_text(msg):
     return "".join(e.get("text", "") for e in msg.get("text_entities", []) or [])
@@ -74,7 +84,17 @@ def get_code_entities(msg):
     return [e for e in msg.get("text_entities", []) or [] if e.get("type") in ("code", "pre")]
 
 
-# ================= Эвристика классификации (fallback без маркеров) =================
+def date_slug(unixtime):
+    """Human/sortable timestamp used inside filenames, e.g. 2025-05-10_20-14-35."""
+    return datetime.utcfromtimestamp(unixtime).strftime("%Y-%m-%d_%H-%M-%S")
+
+
+def date_human(unixtime):
+    """Human-readable date used in the final commit summary, e.g. 10.05.2025."""
+    return datetime.utcfromtimestamp(unixtime).strftime("%d.%m.%Y")
+
+
+# ================= Heuristic classification (fallback without markers) =================
 
 def code_density(text):
     lines = [l for l in text.split("\n") if l.strip()]
@@ -96,10 +116,22 @@ def detect_extension(text, code_entities=None):
     for ext, rx in KEYWORD_EXT_RULES:
         if rx.search(text):
             return ext
-    return "py"
+    # No known language keywords matched: don't guess "py" by default, since
+    # that mislabels plain text/logs. Plain text is a safer fallback.
+    return "txt"
+
+
+def looks_like_terminal_session(text):
+    """A pasted console/terminal session (cmd.exe or shell prompts repeated
+    several times) should never be classified as source code, even though its
+    prompts can otherwise satisfy the generic code heuristics."""
+    return len(TERMINAL_PROMPT_RE.findall(text)) >= 2
 
 
 def classify(text, code_entities):
+    if looks_like_terminal_session(text):
+        return "log", "log"
+
     density = code_density(text)
     has_named_code_block = any(len(e.get("text", "")) > 20 for e in code_entities)
     if density >= 0.4 or (has_named_code_block and density >= 0.25):
@@ -119,10 +151,10 @@ def extract_commit_summary(text, category):
     return first_line[:60] if first_line else "sync entry"
 
 
-# ================= Разбиение по маркерам путей =================
+# ================= Splitting by file path markers =================
 
 def sanitize_path(raw_path):
-    """Защита от path traversal и приведение к безопасному относительному пути."""
+    """Guards against path traversal and normalizes to a safe relative path."""
     parts = [p for p in raw_path.replace("\\", "/").split("/") if p not in ("", ".", "..")]
     if not parts:
         return None
@@ -130,8 +162,8 @@ def sanitize_path(raw_path):
 
 
 def find_file_markers(text):
-    """Ищет оба стиля маркеров и возвращает единый список (start, end, path),
-    отсортированный по позиции. При пересечении приоритет отдаётся 'fancy' стилю."""
+    """Finds both marker styles and returns a single list (start, end, path),
+    sorted by position. On overlap, the 'fancy' style takes priority."""
     markers = []
     covered = []
 
@@ -153,7 +185,7 @@ def find_file_markers(text):
 
 
 def split_by_markers(text):
-    """Возвращает (preamble, [(path, content), ...]) либо (text, []) если маркеров нет."""
+    """Returns (preamble, [(path, content), ...]) or (text, []) if no markers found."""
     markers = find_file_markers(text)
     if not markers:
         return text, []
@@ -168,7 +200,7 @@ def split_by_markers(text):
     return preamble, segments
 
 
-# ================= Git-утилиты =================
+# ================= Git utilities =================
 
 def run(cmd, env=None, check=True):
     return subprocess.run(
@@ -182,7 +214,7 @@ def ensure_git_identity():
         res = subprocess.run(["git", "config", key], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if not res.stdout.strip():
             subprocess.run(["git", "config", key, default], check=True)
-            print(f"git config {key} не был задан, установлен временный: {default}")
+            print(f"git config {key} was not set, applied temporary value: {default}")
 
 
 def load_manifest():
@@ -198,7 +230,7 @@ def save_manifest(done_ids):
 
 
 def commit_files(file_paths, git_date, commit_message, done_ids, msg_ids):
-    """git add + git commit с подменой даты. Возвращает True если коммит создан."""
+    """git add + git commit with a spoofed date. Returns True if a commit was created."""
     for fp in file_paths:
         run(["git", "add", fp])
 
@@ -218,13 +250,13 @@ def commit_files(file_paths, git_date, commit_message, done_ids, msg_ids):
     return True
 
 
-# ================= Группировка сообщений в "юниты" =================
+# ================= Grouping messages into "units" =================
 
 def build_units(messages):
-    """Разбивает отсортированные сообщения на юниты: одиночные сообщения
-    остаются как есть, подряд идущие длинные (>=CLUSTER_MIN_LEN) сообщения
-    с разрывом <=CLUSTER_MAX_GAP_SEC сек объединяются в один юнит (это,
-    вероятно, один Ctrl+V, разрезанный Telegram по лимиту в 4096 символов)."""
+    """Splits sorted messages into units: single messages stay as-is;
+    consecutive long (>=CLUSTER_MIN_LEN) messages with a gap <=CLUSTER_MAX_GAP_SEC
+    seconds are merged into one unit (this is likely a single Ctrl+V paste
+    that Telegram cut up at its 4096-char limit)."""
     units = []
     current = []
 
@@ -249,20 +281,20 @@ def build_units(messages):
     return units
 
 
-# ================= Основной цикл =================
+# ================= Main loop =================
 
 def parse_and_commit(json_path=JSON_PATH):
     if not os.path.exists(json_path):
-        print(f"Ошибка: Файл {json_path} не найден!")
+        print(f"Error: file {json_path} not found!")
         return
 
-    print("Читаем и парсим json...")
+    print("Reading and parsing json...")
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     messages = [m for m in data.get("messages", []) if m.get("type") == "message"]
     if not messages:
-        print("В файле не найдено сообщений.")
+        print("No messages found in the file.")
         return
 
     for m in messages:
@@ -271,7 +303,7 @@ def parse_and_commit(json_path=JSON_PATH):
 
     if not os.path.exists(".git"):
         run(["git", "init"])
-        print("Инициализирован новый Git-репозиторий.")
+        print("Initialized a new Git repository.")
 
     ensure_git_identity()
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -280,8 +312,9 @@ def parse_and_commit(json_path=JSON_PATH):
     units = build_units(messages)
 
     stats = {"project_files": 0, "merged_dumps": 0, "code": 0, "mixed": 0, "note": 0,
-              "skipped": 0, "errors": 0}
+              "log": 0, "skipped": 0, "errors": 0}
     commit_count = 0
+    commit_log = []  # list of (human_date, display_name) for the final summary
 
     for unit in units:
         unit_ids = [m["id"] for m in unit]
@@ -289,13 +322,15 @@ def parse_and_commit(json_path=JSON_PATH):
             continue
 
         unit_text = "".join(get_full_text(m) for m in unit)
-        git_date = f"{unit[0]['date_unixtime']} +0000"
+        first_unixtime = unit[0]["date_unixtime"]
+        git_date = f"{first_unixtime} +0000"
+        human_date = date_human(first_unixtime)
 
         try:
             preamble, segments = split_by_markers(unit_text)
 
             if segments:
-                # ---- Найдены реальные пути файлов: пишем как настоящий проект ----
+                # ---- Real file paths found: write as an actual project ----
                 written = []
                 for path, content in segments:
                     dest = os.path.join(OUTPUT_DIR, path)
@@ -310,22 +345,24 @@ def parse_and_commit(json_path=JSON_PATH):
                 commit_message = f"[project] {names}{more}"
                 if commit_files(written, git_date, commit_message, done_ids, unit_ids):
                     commit_count += 1
+                    commit_log.append((human_date, f"{names}{more}"))
 
             elif len(unit) > 1:
-                # ---- Разбитый Telegram-ом дамп без явных путей: склеиваем в один файл ----
+                # ---- Telegram-split dump with no explicit paths: merge into one file ----
                 category, ext = classify(unit_text, [])
                 first_id, last_id = unit[0]["id"], unit[-1]["id"]
-                fname = f"dump_{first_id}-{last_id}.{ext}"
+                fname = f"dump_{date_slug(first_unixtime)}_{first_id}-{last_id}.{ext}"
                 dest = os.path.join(OUTPUT_DIR, fname)
                 with open(dest, "w", encoding="utf-8") as f:
                     f.write(unit_text)
                 stats["merged_dumps"] += 1
-                commit_message = f"[merged {len(unit)} msgs] dump {first_id}-{last_id}"
+                commit_message = f"[merged {len(unit)} msgs] dump {first_id}-{last_id} ({human_date})"
                 if commit_files([dest], git_date, commit_message, done_ids, unit_ids):
                     commit_count += 1
+                    commit_log.append((human_date, fname))
 
             else:
-                # ---- Обычное одиночное сообщение ----
+                # ---- Regular single message ----
                 msg = unit[0]
                 text = unit_text
                 code_entities = get_code_entities(msg)
@@ -338,13 +375,15 @@ def parse_and_commit(json_path=JSON_PATH):
 
                 category, ext = classify(text, code_entities)
                 stats[category] += 1
-                fname = f"msg_{msg['id']}.{ext}"
+                fname = f"msg_{date_slug(msg['date_unixtime'])}_id{msg['id']}.{ext}"
                 dest = os.path.join(OUTPUT_DIR, fname)
 
                 if category == "mixed":
                     content = f"<!-- Telegram msg_id={msg['id']}, date={msg.get('date')} -->\n\n{text}"
                 elif category == "note":
-                    content = f"# Запись из канала ({msg.get('date')}):\n\n{text}"
+                    content = f"# Note from channel ({msg.get('date')}):\n\n{text}"
+                elif category == "log":
+                    content = f"# Terminal session from channel ({msg.get('date')}):\n\n{text}"
                 else:
                     content = text
 
@@ -352,33 +391,44 @@ def parse_and_commit(json_path=JSON_PATH):
                     f.write(content)
 
                 summary = extract_commit_summary(text, category)
-                prefix = {"code": "code", "mixed": "task+code", "note": "note"}[category]
-                commit_message = f"[{prefix}] msg {msg['id']}: {summary}"
+                prefix = {"code": "code", "mixed": "task+code", "note": "note", "log": "log"}[category]
+                commit_message = f"[{prefix}] msg {msg['id']} ({human_date}): {summary}"
                 if commit_files([dest], git_date, commit_message, done_ids, unit_ids):
                     commit_count += 1
+                    commit_log.append((human_date, fname))
 
             if commit_count and commit_count % 100 == 0:
-                print(f"Успешно создано коммитов: {commit_count}")
+                print(f"Commits created so far: {commit_count}")
                 save_manifest(done_ids)
 
         except subprocess.CalledProcessError as e:
             stats["errors"] += 1
-            print(f"[ОШИБКА] unit_ids={unit_ids}: {e}", file=sys.stderr)
+            print(f"[ERROR] unit_ids={unit_ids}: {e}", file=sys.stderr)
             continue
 
     save_manifest(done_ids)
 
     print(
-        f"\nГотово! Коммитов создано: {commit_count}\n"
-        f"  файлов реального проекта (по маркерам путей): {stats['project_files']}\n"
-        f"  склеенных дампов без маркеров (multi-msg): {stats['merged_dumps']}\n"
-        f"  одиночный код (.py/.js/...): {stats['code']}\n"
-        f"  смешанное (задание+код, .md): {stats['mixed']}\n"
-        f"  заметки (.txt): {stats['note']}\n"
-        f"  пропущено (короткие/пустые): {stats['skipped']}\n"
-        f"  ошибок: {stats['errors']}\n"
-        f"\nТеперь: git remote add origin <url> && git push -u origin main"
+        f"\nDone! Commits created: {commit_count}\n"
+        f"  real project files (matched by path markers): {stats['project_files']}\n"
+        f"  merged dumps without markers (multi-msg): {stats['merged_dumps']}\n"
+        f"  single code messages (.py/.js/...): {stats['code']}\n"
+        f"  mixed (task+code, .md): {stats['mixed']}\n"
+        f"  notes (.txt): {stats['note']}\n"
+        f"  terminal/console sessions (.log): {stats['log']}\n"
+        f"  skipped (short/empty): {stats['skipped']}\n"
+        f"  errors: {stats['errors']}\n"
+        f"\nNext: git remote add origin <url> && git push -u origin main"
     )
+
+    if commit_log:
+        answer = input(
+            f"\nPrint all {len(commit_log)} commit names with their dates? (Y/n): "
+        ).strip().lower()
+        if answer in ("", "y", "yes"):
+            print()
+            for human_date, name in commit_log:
+                print(f"{human_date}: {name}")
 
 
 if __name__ == "__main__":
